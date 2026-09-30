@@ -2,13 +2,16 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.MeterRegistry
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import ru.quipy.payments.metrics.PaymentAccountMetrics
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
@@ -20,6 +23,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    meterRegistry: MeterRegistry,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -40,10 +44,23 @@ class PaymentExternalSystemAdapterImpl(
         rate = rateLimitPerSec.toLong(),
         window = Duration.ofSeconds(1),
     )
+    private val ongoingWindow = OngoingWindow(parallelRequests, fair = true)
+    private val metrics = PaymentAccountMetrics(meterRegistry, accountName, ongoingWindow)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        rateLimiter.tickBlocking()
+        val waitStartedAt = now()
+        ongoingWindow.acquire()
+        metrics.recordWindowWait(Duration.ofMillis(now() - waitStartedAt))
 
+        try {
+            rateLimiter.tickBlocking()
+            submitPayment(paymentId, amount, paymentStartedAt)
+        } finally {
+            ongoingWindow.release()
+        }
+    }
+
+    private fun submitPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
