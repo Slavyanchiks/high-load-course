@@ -2,12 +2,16 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.MeterRegistry
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.OngoingWindow
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import ru.quipy.payments.metrics.PaymentAccountMetrics
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
@@ -19,6 +23,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    meterRegistry: MeterRegistry,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -35,8 +40,55 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val client = OkHttpClient.Builder().build()
+    private val rateLimiter = SlidingWindowRateLimiter(
+        rate = rateLimitPerSec.toLong(),
+        window = Duration.ofSeconds(1),
+    )
+    private val ongoingWindow = OngoingWindow(parallelRequests, fair = true)
+    private val metrics = PaymentAccountMetrics(meterRegistry, accountName, ongoingWindow)
+
+    private val maxProcessingTime = requestAverageProcessingTime.multipliedBy(2)
+
+    private val worstCaseThroughputPerSec = minOf(
+        rateLimitPerSec.toDouble(),
+        parallelRequests * 1000.0 / maxProcessingTime.toMillis(),
+    )
+
+    override fun estimatedFinishTime(paymentsAhead: Int): Long {
+        val queuedAhead = (paymentsAhead - parallelRequests + 1).coerceAtLeast(0)
+        return now() + (queuedAhead * 1000 / worstCaseThroughputPerSec).toLong() + maxProcessingTime.toMillis()
+    }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        val waitStartedAt = now()
+        ongoingWindow.acquire()
+        metrics.recordWindowWait(Duration.ofMillis(now() - waitStartedAt))
+
+        try {
+            if (now() >= deadline) {
+                skipExpiredPayment(paymentId, paymentStartedAt)
+                return
+            }
+            rateLimiter.tickBlocking()
+            submitPayment(paymentId, amount, paymentStartedAt)
+        } finally {
+            ongoingWindow.release()
+        }
+    }
+
+    private fun skipExpiredPayment(paymentId: UUID, paymentStartedAt: Long) {
+        logger.warn("[$accountName] Payment $paymentId skipped: deadline exceeded")
+
+        val transactionId = UUID.randomUUID()
+        paymentESService.update(paymentId) {
+            it.logSubmission(success = false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+        }
+        paymentESService.update(paymentId) {
+            it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
+        }
+    }
+
+    private fun submitPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
