@@ -31,8 +31,8 @@ class OrderPayer(meterRegistry: MeterRegistry) {
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = ThreadPoolExecutor(
-        16,
-        16,
+        330,
+        330,
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(8_000),

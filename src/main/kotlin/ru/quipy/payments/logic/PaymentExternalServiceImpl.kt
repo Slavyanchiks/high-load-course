@@ -15,6 +15,7 @@ import ru.quipy.payments.metrics.PaymentAccountMetrics
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.atomic.AtomicInteger
 
 
 // Advice: always treat time as a Duration
@@ -54,8 +55,10 @@ class PaymentExternalSystemAdapterImpl(
         parallelRequests * 1000.0 / maxProcessingTime.toMillis(),
     )
 
+    private val inFlightRequests = AtomicInteger()
+
     override fun estimatedFinishTime(paymentsAhead: Int): Long {
-        val queuedAhead = (paymentsAhead - parallelRequests + 1).coerceAtLeast(0)
+        val queuedAhead = (paymentsAhead - inFlightRequests.get() + 1).coerceAtLeast(0)
         return now() + (queuedAhead * 1000 / worstCaseThroughputPerSec).toLong() + maxProcessingTime.toMillis()
     }
 
@@ -65,30 +68,13 @@ class PaymentExternalSystemAdapterImpl(
         metrics.recordWindowWait(Duration.ofMillis(now() - waitStartedAt))
 
         try {
-            if (now() >= deadline) {
-                skipExpiredPayment(paymentId, paymentStartedAt)
-                return
-            }
-            rateLimiter.tickBlocking()
-            submitPayment(paymentId, amount, paymentStartedAt)
+            submitPayment(paymentId, amount, paymentStartedAt, deadline)
         } finally {
             ongoingWindow.release()
         }
     }
 
-    private fun skipExpiredPayment(paymentId: UUID, paymentStartedAt: Long) {
-        logger.warn("[$accountName] Payment $paymentId skipped: deadline exceeded")
-
-        val transactionId = UUID.randomUUID()
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-        }
-        paymentESService.update(paymentId) {
-            it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
-        }
-    }
-
-    private fun submitPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
+    private fun submitPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -99,8 +85,18 @@ class PaymentExternalSystemAdapterImpl(
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
+        rateLimiter.tickBlocking()
+        if (now() >= deadline) {
+            logger.warn("[$accountName] Payment $paymentId skipped: deadline exceeded")
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
+            }
+            return
+        }
+
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
+        inFlightRequests.incrementAndGet()
         try {
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
@@ -140,6 +136,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            inFlightRequests.decrementAndGet()
         }
     }
 
