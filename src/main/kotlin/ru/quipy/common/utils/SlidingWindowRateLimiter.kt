@@ -35,7 +35,7 @@ class SlidingWindowRateLimiter(
 
     fun tickBlocking() {
         while (!tick()) {
-            Thread.sleep(10)
+            Thread.sleep(BLOCKING_POLL_INTERVAL.toMillis())
         }
     }
 
@@ -66,5 +66,7 @@ class SlidingWindowRateLimiter(
     }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
     companion object {
         private val logger: Logger = LoggerFactory.getLogger(SlidingWindowRateLimiter::class.java)
+
+        private val BLOCKING_POLL_INTERVAL: Duration = Duration.ofMillis(10)
     }
 }

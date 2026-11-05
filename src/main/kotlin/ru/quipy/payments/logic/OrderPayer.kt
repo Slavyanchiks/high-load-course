@@ -1,7 +1,5 @@
 package ru.quipy.payments.logic
 
-import io.micrometer.core.instrument.Counter
-import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
@@ -11,6 +9,8 @@ import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import ru.quipy.payments.metrics.PaymentAdmissionMetrics
+import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -22,6 +22,12 @@ class OrderPayer(meterRegistry: MeterRegistry) {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
+
+        private const val PAYMENT_WORKER_THREADS = 330
+
+        private const val PAYMENT_QUEUE_CAPACITY = 8_000
+
+        private val WORKER_KEEP_ALIVE: Duration = Duration.ZERO
     }
 
     @Autowired
@@ -31,34 +37,33 @@ class OrderPayer(meterRegistry: MeterRegistry) {
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = ThreadPoolExecutor(
-        330,
-        330,
-        0L,
+        PAYMENT_WORKER_THREADS,
+        PAYMENT_WORKER_THREADS,
+        WORKER_KEEP_ALIVE.toMillis(),
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(8_000),
+        LinkedBlockingQueue(PAYMENT_QUEUE_CAPACITY),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
 
     private val paymentsInProgress = AtomicInteger()
 
-    private val acceptedPayments = Counter.builder("payment.incoming").tag("result", "accepted").register(meterRegistry)
-    private val rejectedPayments = Counter.builder("payment.incoming").tag("result", "rejected").register(meterRegistry)
+    private val metrics = PaymentAdmissionMetrics(meterRegistry, paymentsInProgress, paymentExecutor)
 
-    init {
-        Gauge.builder("payment.inprogress", paymentsInProgress) { it.get().toDouble() }.register(meterRegistry)
-    }
+    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadlineEpochMs: Long): Long {
+        val createdAtEpochMs = nowEpochMs()
 
-    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
-        val createdAt = System.currentTimeMillis()
+        val estimatedFinishEpochMs = paymentService.estimatedFinishEpochMs(paymentsInProgress.getAndIncrement())
+        val deadlineBudget = Duration.ofMillis(deadlineEpochMs - createdAtEpochMs)
+        val estimatedLatency = Duration.ofMillis(estimatedFinishEpochMs - createdAtEpochMs)
 
-        val estimatedFinish = paymentService.estimatedFinishTime(paymentsInProgress.getAndIncrement())
-        if (estimatedFinish > deadline) {
+        if (estimatedFinishEpochMs > deadlineEpochMs) {
             paymentsInProgress.decrementAndGet()
-            rejectedPayments.increment()
-            throw TooManyRequestsException(retryAfter = createdAt + (estimatedFinish - deadline))
+            val retryAfterDelay = Duration.ofMillis(estimatedFinishEpochMs - deadlineEpochMs)
+            safeRecordMetrics { metrics.recordRejected(deadlineBudget, estimatedLatency, retryAfterDelay) }
+            throw TooManyRequestsException(retryAfterEpochMs = createdAtEpochMs + retryAfterDelay.toMillis())
         }
-        acceptedPayments.increment()
+        safeRecordMetrics { metrics.recordAccepted(deadlineBudget, estimatedLatency) }
 
         paymentExecutor.submit {
             try {
@@ -71,16 +76,24 @@ class OrderPayer(meterRegistry: MeterRegistry) {
                 }
                 logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
-                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+                paymentService.submitPaymentRequest(paymentId, amount, createdAtEpochMs, deadlineEpochMs)
             } finally {
                 paymentsInProgress.decrementAndGet()
             }
         }
-        return createdAt
+        return createdAtEpochMs
+    }
+
+    private inline fun safeRecordMetrics(record: () -> Unit) {
+        try {
+            record()
+        } catch (e: Exception) {
+            logger.error("Failed to record admission metrics", e)
+        }
     }
 }
 
 /**
- * Payment can't be processed before its deadline. [retryAfter] is epoch millis when it makes sense to retry.
+ * Payment can't be processed before its deadline. [retryAfterEpochMs] is epoch millis when it makes sense to retry.
  */
-class TooManyRequestsException(val retryAfter: Long) : RuntimeException("Payment can't be processed in time")
+class TooManyRequestsException(val retryAfterEpochMs: Long) : RuntimeException("Payment can't be processed in time")

@@ -7,13 +7,13 @@ interface PaymentService {
     /**
      * Submit payment request to some external service.
      */
-    fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
+    fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAtEpochMs: Long, deadlineEpochMs: Long)
 
     /**
      * Pessimistic estimate (epoch millis) of when a new payment would be processed
      * if [paymentsAhead] payments are already accepted and not yet finished.
      */
-    fun estimatedFinishTime(paymentsAhead: Int): Long
+    fun estimatedFinishEpochMs(paymentsAhead: Int): Long
 }
 
 /**
@@ -23,9 +23,9 @@ interface PaymentService {
 
  */
 interface PaymentExternalSystemAdapter {
-    fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
+    fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAtEpochMs: Long, deadlineEpochMs: Long)
 
-    fun estimatedFinishTime(paymentsAhead: Int): Long
+    fun estimatedFinishEpochMs(paymentsAhead: Int): Long
 
     fun name(): String
 

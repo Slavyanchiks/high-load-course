@@ -59,19 +59,22 @@ class APIController {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): PaymentSubmissionDto {
+    fun payOrder(
+        @PathVariable orderId: UUID,
+        @RequestParam("deadline") deadlineEpochMs: Long,
+    ): PaymentSubmissionDto {
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId) ?: throw IllegalArgumentException("No such order $orderId")
 
-        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+        val createdAtEpochMs = orderPayer.processPayment(orderId, order.price, paymentId, deadlineEpochMs)
         orderRepository.save(order.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
-        return PaymentSubmissionDto(createdAt, paymentId)
+        return PaymentSubmissionDto(createdAtEpochMs, paymentId)
     }
 
     @ExceptionHandler(TooManyRequestsException::class)
     fun handleTooManyRequests(e: TooManyRequestsException): ResponseEntity<Unit> =
         ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-            .header(HttpHeaders.RETRY_AFTER, e.retryAfter.toString())
+            .header(HttpHeaders.RETRY_AFTER, e.retryAfterEpochMs.toString())
             .build()
 
     class PaymentSubmissionDto(

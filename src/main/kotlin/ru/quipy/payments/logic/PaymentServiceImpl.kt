@@ -21,12 +21,12 @@ class PaymentSystemImpl(
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
     }
 
-    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAtEpochMs: Long, deadlineEpochMs: Long) {
         for (account in paymentAccounts) {
-            account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
+            account.performPaymentAsync(paymentId, amount, paymentStartedAtEpochMs, deadlineEpochMs)
         }
     }
 
-    override fun estimatedFinishTime(paymentsAhead: Int): Long =
-        paymentAccounts.maxOf { it.estimatedFinishTime(paymentsAhead) }
+    override fun estimatedFinishEpochMs(paymentsAhead: Int): Long =
+        paymentAccounts.maxOf { it.estimatedFinishEpochMs(paymentsAhead) }
 }

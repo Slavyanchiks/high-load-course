@@ -31,6 +31,10 @@ class PaymentExternalSystemAdapterImpl(
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
+
+        private val RATE_LIMIT_WINDOW: Duration = Duration.ofSeconds(1)
+
+        private const val PROCESSING_TIME_SAFETY_FACTOR = 2L
         val mapper = ObjectMapper().registerKotlinModule()
     }
 
@@ -43,38 +47,47 @@ class PaymentExternalSystemAdapterImpl(
     private val client = OkHttpClient.Builder().build()
     private val rateLimiter = SlidingWindowRateLimiter(
         rate = rateLimitPerSec.toLong(),
-        window = Duration.ofSeconds(1),
+        window = RATE_LIMIT_WINDOW,
     )
     private val ongoingWindow = OngoingWindow(parallelRequests, fair = true)
     private val metrics = PaymentAccountMetrics(meterRegistry, accountName, ongoingWindow)
 
-    private val maxProcessingTime = requestAverageProcessingTime.multipliedBy(2)
+    private val maxProcessingTime = requestAverageProcessingTime.multipliedBy(PROCESSING_TIME_SAFETY_FACTOR)
 
-    private val worstCaseThroughputPerSec = minOf(
-        rateLimitPerSec.toDouble(),
-        parallelRequests * 1000.0 / maxProcessingTime.toMillis(),
+    private val worstCaseIntervalBetweenCalls: Duration = maxOf(
+        RATE_LIMIT_WINDOW.dividedBy(rateLimitPerSec.toLong()),
+        maxProcessingTime.dividedBy(parallelRequests.toLong()),
     )
 
     private val inFlightRequests = AtomicInteger()
 
-    override fun estimatedFinishTime(paymentsAhead: Int): Long {
+    override fun estimatedFinishEpochMs(paymentsAhead: Int): Long {
         val queuedAhead = (paymentsAhead - inFlightRequests.get() + 1).coerceAtLeast(0)
-        return now() + (queuedAhead * 1000 / worstCaseThroughputPerSec).toLong() + maxProcessingTime.toMillis()
+        val waitForStart = worstCaseIntervalBetweenCalls.multipliedBy(queuedAhead.toLong())
+        return nowEpochMs() + waitForStart.plus(maxProcessingTime).toMillis()
     }
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        val waitStartedAt = now()
+    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAtEpochMs: Long, deadlineEpochMs: Long) {
+        val waitStartedAtEpochMs = nowEpochMs()
         ongoingWindow.acquire()
-        metrics.recordWindowWait(Duration.ofMillis(now() - waitStartedAt))
+        metrics.recordWindowWait(Duration.ofMillis(nowEpochMs() - waitStartedAtEpochMs))
 
         try {
-            submitPayment(paymentId, amount, paymentStartedAt, deadline)
+            submitPayment(paymentId, amount, paymentStartedAtEpochMs, deadlineEpochMs)
         } finally {
             ongoingWindow.release()
         }
     }
 
-    private fun submitPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    private fun finish(outcome: PaymentAccountMetrics.Outcome, deadlineEpochMs: Long) {
+        try {
+            metrics.recordFinished(outcome, Duration.ofMillis(deadlineEpochMs - nowEpochMs()))
+        } catch (e: Exception) {
+            logger.error("[$accountName] Failed to record outcome metrics", e)
+        }
+    }
+
+    private fun submitPayment(paymentId: UUID, amount: Int, paymentStartedAtEpochMs: Long, deadlineEpochMs: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -82,20 +95,25 @@ class PaymentExternalSystemAdapterImpl(
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
         paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            it.logSubmission(success = true, transactionId, nowEpochMs(), Duration.ofMillis(nowEpochMs() - paymentStartedAtEpochMs))
         }
 
+        val rateLimiterWaitStartedAtEpochMs = nowEpochMs()
         rateLimiter.tickBlocking()
-        if (now() >= deadline) {
+        metrics.recordRateLimiterWait(Duration.ofMillis(nowEpochMs() - rateLimiterWaitStartedAtEpochMs))
+
+        if (nowEpochMs() >= deadlineEpochMs) {
             logger.warn("[$accountName] Payment $paymentId skipped: deadline exceeded")
             paymentESService.update(paymentId) {
-                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
+                it.logProcessing(false, nowEpochMs(), transactionId, reason = "Deadline exceeded.")
             }
+            finish(PaymentAccountMetrics.Outcome.DEADLINE_SKIPPED, deadlineEpochMs)
             return
         }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
+        var outcome = PaymentAccountMetrics.Outcome.ERROR
         inFlightRequests.incrementAndGet()
         try {
             val request = Request.Builder().run {
@@ -116,29 +134,33 @@ class PaymentExternalSystemAdapterImpl(
                 // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
                 // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
                 paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                    it.logProcessing(body.result, nowEpochMs(), transactionId, reason = body.message)
                 }
+                outcome = if (body.result) PaymentAccountMetrics.Outcome.SUCCESS else PaymentAccountMetrics.Outcome.FAIL
             }
         } catch (e: Exception) {
             when (e) {
                 is SocketTimeoutException -> {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
                     paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                        it.logProcessing(false, nowEpochMs(), transactionId, reason = "Request timeout.")
                     }
+                    outcome = PaymentAccountMetrics.Outcome.TIMEOUT
                 }
 
                 else -> {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
 
                     paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
+                        it.logProcessing(false, nowEpochMs(), transactionId, reason = e.message)
                     }
+                    outcome = PaymentAccountMetrics.Outcome.ERROR
                 }
             }
         } finally {
             inFlightRequests.decrementAndGet()
         }
+        finish(outcome, deadlineEpochMs)
     }
 
     override fun price() = properties.price
@@ -149,4 +171,4 @@ class PaymentExternalSystemAdapterImpl(
 
 }
 
-public fun now() = System.currentTimeMillis()
+fun nowEpochMs(): Long = System.currentTimeMillis()
