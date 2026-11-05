@@ -4,28 +4,24 @@ import java.time.Duration
 import java.util.*
 
 interface PaymentService {
-    /**
-     * Submit payment request to some external service.
-     */
-    fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
+    fun tryReserve(deadline: Long): Long?
 
     /**
-     * Pessimistic estimate (epoch millis) of when a new payment would be processed
-     * if [paymentsAhead] payments are already accepted and not yet finished.
+     * Отправить запрос на оплату во внешний сервис.
      */
-    fun estimatedFinishTime(paymentsAhead: Int): Long
+    fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
 }
 
 /**
- * Adapter for external payment system. Represents the account in the external system.
+ * Адаптер внешней платежной системы. Представляет аккаунт во внешней системе.
  *
- * !!! You can extend the interface with additional methods if needed. !!!
+ * !!! При необходимости интерфейс можно расширять дополнительными методами. !!!
 
  */
 interface PaymentExternalSystemAdapter {
-    fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
+    fun tryReserve(deadline: Long): Long?
 
-    fun estimatedFinishTime(paymentsAhead: Int): Long
+    fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
 
     fun name(): String
 
@@ -35,7 +31,7 @@ interface PaymentExternalSystemAdapter {
 }
 
 /**
- * Describes properties of payment-provider accounts.
+ * Свойства аккаунтов провайдера оплаты.
  */
 data class PaymentAccountProperties(
     val serviceName: String,
@@ -48,7 +44,7 @@ data class PaymentAccountProperties(
 )
 
 /**
- * Describes response from external service.
+ * Ответ внешнего сервиса.
  */
 class ExternalSysResponse(
     val transactionId: String,

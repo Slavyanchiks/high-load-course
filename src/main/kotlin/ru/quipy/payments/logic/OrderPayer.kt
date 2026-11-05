@@ -1,7 +1,6 @@
 package ru.quipy.payments.logic
 
 import io.micrometer.core.instrument.Counter
-import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
@@ -15,7 +14,6 @@ import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 
 @Service
 class OrderPayer(meterRegistry: MeterRegistry) {
@@ -40,47 +38,33 @@ class OrderPayer(meterRegistry: MeterRegistry) {
         CallerBlockingRejectedExecutionHandler()
     )
 
-    private val paymentsInProgress = AtomicInteger()
-
     private val acceptedPayments = Counter.builder("payment.incoming").tag("result", "accepted").register(meterRegistry)
     private val rejectedPayments = Counter.builder("payment.incoming").tag("result", "rejected").register(meterRegistry)
-
-    init {
-        Gauge.builder("payment.inprogress", paymentsInProgress) { it.get().toDouble() }.register(meterRegistry)
-    }
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
 
-        val estimatedFinish = paymentService.estimatedFinishTime(paymentsInProgress.getAndIncrement())
-        if (estimatedFinish > deadline) {
-            paymentsInProgress.decrementAndGet()
+        val retryAfter = paymentService.tryReserve(deadline)
+        if (retryAfter != null) {
             rejectedPayments.increment()
-            throw TooManyRequestsException(retryAfter = createdAt + (estimatedFinish - deadline))
+            throw TooManyRequestsException(retryAfter)
         }
         acceptedPayments.increment()
 
         paymentExecutor.submit {
-            try {
-                val createdEvent = paymentESService.create {
-                    it.create(
-                        paymentId,
-                        orderId,
-                        amount
-                    )
-                }
-                logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
-
-                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
-            } finally {
-                paymentsInProgress.decrementAndGet()
+            val createdEvent = paymentESService.create {
+                it.create(
+                    paymentId,
+                    orderId,
+                    amount
+                )
             }
+            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+
+            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
         return createdAt
     }
 }
 
-/**
- * Payment can't be processed before its deadline. [retryAfter] is epoch millis when it makes sense to retry.
- */
 class TooManyRequestsException(val retryAfter: Long) : RuntimeException("Payment can't be processed in time")
