@@ -10,8 +10,10 @@ import okhttp3.RequestBody
 import okhttp3.Response
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.payments.metrics.PaymentAccountMetrics
 import java.io.IOException
 import java.net.SocketTimeoutException
+import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
@@ -20,17 +22,21 @@ internal class PaymentProviderClient(
     private val serviceName: String,
     private val token: String,
     private val accountName: String,
+    private val metrics: PaymentAccountMetrics,
 ) {
     companion object {
         private val logger = LoggerFactory.getLogger(PaymentProviderClient::class.java)
         private val emptyBody: RequestBody = ByteArray(0).toRequestBody(null)
         private val mapper = ObjectMapper().registerKotlinModule()
 
+        val ATTEMPT_TIMEOUT: Duration = Duration.ofMillis(1300)
+
         private const val TEMPORARY_ERROR = "Temporary error"
-        private val RETRYABLE_HTTP_STATUSES = setOf(429, 500, 502, 503, 504)
+        private val RETRYABLE_HTTP_STATUSES = setOf(408, 429, 500, 502, 503, 504)
     }
 
     private val client = OkHttpClient.Builder()
+        .retryOnConnectionFailure(false)
         .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
         .build()
 
@@ -39,6 +45,7 @@ internal class PaymentProviderClient(
         amount: Int,
         transactionId: UUID,
         deadline: Long,
+        attempt: Int,
     ): ExternalSysResponse {
         logger.info("[$accountName] Submit: $paymentId, txId: $transactionId")
 
@@ -50,13 +57,13 @@ internal class PaymentProviderClient(
                     "&accountName=$accountName" +
                     "&transactionId=$transactionId" +
                     "&paymentId=$paymentId" +
-                    "&amount=$amount"
+                    "&amount=$amount&timeout=$ATTEMPT_TIMEOUT"
             )
             .post(emptyBody)
             .build()
 
         return try {
-            executeHttpRequest(request, deadline).use { response ->
+            executeHttpRequest(request, deadline, attempt).use { response ->
                 val responseBody = response.body?.string()
                 if (!response.isSuccessful) {
                     val message = "HTTP ${response.code}: $responseBody"
@@ -93,10 +100,12 @@ internal class PaymentProviderClient(
         }
     }
 
-    private fun executeHttpRequest(request: Request, deadline: Long): Response {
+    private fun executeHttpRequest(request: Request, deadline: Long, attempt: Int): Response {
         val call = client.newCall(request)
         call.timeout().timeout((deadline - now()).coerceAtLeast(1), TimeUnit.MILLISECONDS)
 
-        return call.execute()
+        if (attempt > 1) metrics.recordRetrySent()
+        val started = System.nanoTime()
+        return call.execute().also { metrics.recordResponseTime(it.code, System.nanoTime() - started) }
     }
 }

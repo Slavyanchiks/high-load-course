@@ -31,33 +31,23 @@ class PaymentExternalSystemAdapterImpl(
 
         private val ADMISSION_MARGIN = Duration.ofMillis(50)
 
-        private const val MAX_ATTEMPTS = 3
+        private const val MAX_ATTEMPTS = 4
 
     }
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
-    private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-
-    private val maxProcessingTime = requestAverageProcessingTime.multipliedBy(2)
 
     private val bucket = DeadlineAwareLeakyBucket(
         rate = rateLimitPerSec,
         window = Duration.ofSeconds(1) + WINDOW_MARGIN,
-        processingTime = maxProcessingTime + ADMISSION_MARGIN,
+        processingTime = PaymentProviderClient.ATTEMPT_TIMEOUT + ADMISSION_MARGIN,
     )
     private val ongoingWindow = OngoingWindow(parallelRequests)
     private val retryPolicy = PaymentRetryPolicy(MAX_ATTEMPTS, bucket)
     private val lifecycleRecorder = PaymentLifecycleRecorder(paymentESService)
-    private val providerClient = PaymentProviderClient(
-        hostPort = paymentProviderHostPort,
-        serviceName = serviceName,
-        token = token,
-        accountName = accountName,
-    )
-
     private data class Payment(
         val id: UUID,
         val amount: Int,
@@ -78,6 +68,14 @@ class PaymentExternalSystemAdapterImpl(
         rateLimitPerSec = rateLimitPerSec,
         bucket = bucket,
         window = ongoingWindow,
+    )
+
+    private val providerClient = PaymentProviderClient(
+        hostPort = paymentProviderHostPort,
+        serviceName = serviceName,
+        token = token,
+        accountName = accountName,
+        metrics = metrics,
     )
 
     init {
@@ -147,7 +145,7 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        providerClient.process(payment.id, payment.amount, payment.transactionId, payment.deadline)
+        providerClient.process(payment.id, payment.amount, payment.transactionId, payment.deadline, payment.attempt)
         metrics.recordSuccessfulAttempt()
         completePayment(payment, success = true)
     }

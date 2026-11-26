@@ -13,16 +13,13 @@
     },
     "annotations": {
       "grafana.app/createdBy": "access-policy:service",
-      "grafana.app/folder": "efzuehpz8ozy8a",
       "grafana.app/managedBy": "classic-file-provisioning",
       "grafana.app/managerId": "OnlineShop",
       "grafana.app/sourceChecksum": "49479726c06b448ef3fd988af1a6d56c",
       "grafana.app/sourcePath": "/etc/grafana/provisioning/dashboards/OnlineShopPaymentWindow.json",
       "grafana.app/sourceTimestamp": "1790796980000",
       "grafana.app/updatedBy": "access-policy:service",
-      "grafana.app/updatedTimestamp": "2026-09-30T19:36:35Z",
-      "grafana.app/folderTitle": "online-shop",
-      "grafana.app/folderUrl": "/dashboards/f/efzuehpz8ozy8a/online-shop"
+      "grafana.app/updatedTimestamp": "2026-09-30T19:36:35Z"
     }
   },
   "spec": {
@@ -660,6 +657,130 @@
             "version": "13.2.2"
           }
         }
+      },
+      "panel-12": {
+        "kind": "Panel",
+        "spec": {
+          "id": 12,
+          "title": "Повторные вызовы за минуту",
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "PBFA97CFB590B2093"
+                      },
+                      "group": "prometheus",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "expr": "sum by (service, account) (increase(payment_external_retry_total{account=~\"$account\",outcome=\"sent\"}[1m]))",
+                        "instant": false,
+                        "legendFormat": "{{service}} / {{account}}",
+                        "range": true
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "13.2.2",
+            "spec": {
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "min": 0
+                },
+                "overrides": []
+              },
+              "options": {}
+            }
+          },
+          "links": []
+        }
+      },
+      "panel-13": {
+        "kind": "Panel",
+        "spec": {
+          "id": 13,
+          "title": "Время ответа провайдера · p95",
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "hidden": false,
+                    "query": {
+                      "datasource": {
+                        "name": "PBFA97CFB590B2093"
+                      },
+                      "group": "prometheus",
+                      "kind": "DataQuery",
+                      "spec": {
+                        "expr": "payment_external_response_time_seconds{account=~\"$account\",status=~\"200|408\",quantile=\"0.95\"}",
+                        "instant": false,
+                        "legendFormat": "HTTP {{status}} · {{service}} / {{account}}",
+                        "range": true
+                      },
+                      "version": "v0"
+                    },
+                    "refId": "A"
+                  }
+                }
+              ],
+              "queryOptions": {},
+              "transformations": []
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "13.2.2",
+            "spec": {
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "s",
+                  "min": 0,
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      },
+                      {
+                        "color": "orange",
+                        "value": 1.3
+                      }
+                    ]
+                  },
+                  "custom": {
+                    "thresholdsStyle": {
+                      "mode": "dashed"
+                    }
+                  }
+                },
+                "overrides": []
+              },
+              "options": {}
+            }
+          },
+          "links": []
+        }
       }
     },
     "layout": {
@@ -758,6 +879,46 @@
                 }
               },
               "title": "Входящие оплаты"
+            }
+          },
+          {
+            "kind": "RowsLayoutRow",
+            "spec": {
+              "collapse": false,
+              "layout": {
+                "kind": "GridLayout",
+                "spec": {
+                  "items": [
+                    {
+                      "kind": "GridLayoutItem",
+                      "spec": {
+                        "element": {
+                          "kind": "ElementReference",
+                          "name": "panel-12"
+                        },
+                        "height": 9,
+                        "width": 12,
+                        "x": 0,
+                        "y": 0
+                      }
+                    },
+                    {
+                      "kind": "GridLayoutItem",
+                      "spec": {
+                        "element": {
+                          "kind": "ElementReference",
+                          "name": "panel-13"
+                        },
+                        "height": 9,
+                        "width": 12,
+                        "x": 12,
+                        "y": 0
+                      }
+                    }
+                  ]
+                }
+              },
+              "title": "Попытки оплаты"
             }
           }
         ]

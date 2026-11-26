@@ -7,6 +7,7 @@ import io.micrometer.core.instrument.Timer
 import ru.quipy.common.utils.DeadlineAwareLeakyBucket
 import ru.quipy.common.utils.OngoingWindow
 import java.time.Duration
+import java.util.concurrent.TimeUnit
 
 class PaymentAccountMetrics(
     val registry: MeterRegistry,
@@ -46,6 +47,13 @@ class PaymentAccountMetrics(
     private val permanentAttemptFailures = counter("payment.external.attempt", "permanent_failure")
     private val attemptsRejectedByDeadline = counter("payment.external.attempt", "deadline_exceeded")
 
+    private val responseTime = Timer.builder("payment.external.response.time")
+        .tag("service", serviceName)
+        .tag("account", accountName)
+        .publishPercentiles(0.95)
+        .withRegistry(registry)
+
+    private val sentRetries = counter("payment.external.retry", "sent")
     private val enqueuedRetries = counter("payment.external.retry", "enqueued")
     private val retriesRejectedByDeadline = counter("payment.external.retry", "rejected_deadline")
     private val retriesRejectedByAttemptLimit = counter("payment.external.retry", "rejected_attempt_limit")
@@ -57,6 +65,11 @@ class PaymentAccountMetrics(
     fun recordPermanentAttemptFailure() = permanentAttemptFailures.increment()
 
     fun recordAttemptRejectedByDeadline() = attemptsRejectedByDeadline.increment()
+
+    fun recordResponseTime(status: Int, elapsedNanos: Long) =
+        responseTime.withTag("status", status.toString()).record(elapsedNanos, TimeUnit.NANOSECONDS)
+
+    fun recordRetrySent() = sentRetries.increment()
 
     fun recordRetryEnqueued() = enqueuedRetries.increment()
 
